@@ -114,66 +114,147 @@ public abstract class AbstractUserDetailsAuthenticationProvider implements Authe
         doAfterPropertiesSet();
     }
 
-    public Authentication authenticate(Authentication authentication) throws AuthenticationException {
+	/**
+	 * purpose of this class is to return the user details as well as cache info during the authenticate()
+	 * for simplification the members are package protected to avoid the need to call setters and getters
+	 * @author ronik
+	 *
+	 */
+	public class ObtainUserDetailsCallResult {
+    	boolean cacheWasUsed; //specifies whether cache was used or not
+    	UserDetails user;	  //the user details
+    }
+
+	/**
+	 * this method is suppose to return null if this is not right authentication provider for this user.
+	 * but if it is, then it's suppose to perform the authentication checks and authenticate the user.
+	 * sub-classes should override the shouldAuthenticate() method in which they can examine the user
+	 * details and determine whether should be authenticating this user. by default the provider will
+	 * attempt to authenticate this user 
+	 * if authentication fails it throws an exception
+	 * @param authentication the authentication object 
+	 * @throws AuthenticationException 
+	 */
+	@Override
+	public Authentication authenticate(Authentication authentication)
+			throws AuthenticationException {
         Assert.isInstanceOf(UsernamePasswordAuthenticationToken.class, authentication,
-            messages.getMessage("AbstractUserDetailsAuthenticationProvider.onlySupports",
-                "Only UsernamePasswordAuthenticationToken is supported"));
+                messages.getMessage("AbstractUserDetailsAuthenticationProvider.onlySupports",
+                    "Only UsernamePasswordAuthenticationToken is supported"));
 
-        // Determine username
-        String username = (authentication.getPrincipal() == null) ? "NONE_PROVIDED" : authentication.getName();
+        // Determine username        
+        String username = getUserName(authentication);
 
-        boolean cacheWasUsed = true;
-        UserDetails user = this.userCache.getUserFromCache(username);
+        ObtainUserDetailsCallResult callResult=obtainUserDetails(authentication, username);
+        
+        Authentication result = null;
+        if (shouldAuthenticate(username,callResult)) {
+            UserDetails user = callResult.user;
+            boolean cacheWasUsed = callResult.cacheWasUsed;
 
-        if (user == null) {
-            cacheWasUsed = false;
+	        try {
+	        	checkAndAuthenticateUser(username,user, authentication);
+	        } catch (AuthenticationException exception) {
+	            if (cacheWasUsed) {
+	                // There was a problem, so try again after checking
+	                // we're using latest data (i.e. not from the cache)
+	            	cacheWasUsed = false;
+	            	user = retrieveUser(username, (UsernamePasswordAuthenticationToken) authentication);
+	                checkAndAuthenticateUser(username, user, authentication); //2nd time
+	            } else {
+	                throw exception;
+	            }
+	        }
+	
+	        getPostAuthenticationChecks().check(user);
+	
+	        if (!cacheWasUsed) {
+	            getUserCache().putUserInCache(user);
+	        }
+	
+	        result=createSuccessAuthentication(isForcePrincipalAsString() ? user.getUsername() : user, authentication, user);
+        }
+        return result;
+
+	}
+
+	/**
+	 * called by the authenticate method to get the user name based on the authentication 
+	 * @param authentication the authentication object
+	 * @return the user name
+	 */
+	protected String getUserName(Authentication authentication) {
+		return (authentication.getPrincipal() == null) ? "NONE_PROVIDED" : authentication.getName();
+	}
+
+	/**
+	 * called by the authenticate method to when this provider is supposed to perform the authentication of this user
+	 * perform pre authentication checks, and perform the actual authentication
+	 * throw an exception if the checks or authenticaion fail 
+	 * @param username the user name
+	 * @param user the usr details
+	 * @param authentication the authentication info
+	 */
+	protected void checkAndAuthenticateUser(String username, UserDetails user,Authentication authentication) {
+        getPreAuthenticationChecks().check(user);
+        additionalAuthenticationChecks(user, (UsernamePasswordAuthenticationToken) authentication);
+	}
+
+	/**
+	 * called by the authenticate method to check based on the user details whether 'this' is the right authentication provider
+	 * for this user  
+	 * @param username the username
+	 * @param callResult the user details and whether it was obtained from the cache or not
+	 * @return true if this provider should do the authentication for this user, false otherwise
+	 */
+	protected boolean shouldAuthenticate(String username, ObtainUserDetailsCallResult callResult) {
+		return true; //default
+	}
+
+	/**
+	 * called by the authenticate method to obtain the user details  
+	 * @param authentication the authentication obejct
+	 * @param username the user name
+	 * @return an object which contains the user details but also specifies whether cache was used for that
+	 */
+	protected ObtainUserDetailsCallResult obtainUserDetails(Authentication authentication,String username) {
+		
+		ObtainUserDetailsCallResult callResult=new ObtainUserDetailsCallResult();
+		callResult.cacheWasUsed = true;
+		callResult.user = getUserCache().getUserFromCache(username);
+
+        if (callResult.user == null) {
+        	callResult.cacheWasUsed = false;
 
             try {
-                user = retrieveUser(username, (UsernamePasswordAuthenticationToken) authentication);
+            	callResult.user = retrieveUser(username, (UsernamePasswordAuthenticationToken) authentication);
             } catch (UsernameNotFoundException notFound) {
-                logger.debug("User '" + username + "' not found");
-
-                if (hideUserNotFoundExceptions) {
-                    throw new BadCredentialsException(messages.getMessage(
-                            "AbstractUserDetailsAuthenticationProvider.badCredentials", "Bad credentials"));
-                } else {
-                    throw notFound;
-                }
+                userNotFound(username, notFound); //may re-throw the exception
             }
 
-            Assert.notNull(user, "retrieveUser returned null - a violation of the interface contract");
+            Assert.notNull(callResult.user, "retrieveUser returned null - a violation of the interface contract");
         }
 
-        try {
-            preAuthenticationChecks.check(user);
-            additionalAuthenticationChecks(user, (UsernamePasswordAuthenticationToken) authentication);
-        } catch (AuthenticationException exception) {
-            if (cacheWasUsed) {
-                // There was a problem, so try again after checking
-                // we're using latest data (i.e. not from the cache)
-                cacheWasUsed = false;
-                user = retrieveUser(username, (UsernamePasswordAuthenticationToken) authentication);
-                preAuthenticationChecks.check(user);
-                additionalAuthenticationChecks(user, (UsernamePasswordAuthenticationToken) authentication);
-            } else {
-                throw exception;
-            }
-        }
+		return callResult; 
+	}
 
-        postAuthenticationChecks.check(user);
+	/**
+	 * this method may be called by a sub-class when the user entity is not known to this provider
+	 * and a UsernameNotFoundException is caught
+	 * @param username the user name of the user trying to be authenticated
+	 * @param notFound the exception caught
+	 */
+	protected void userNotFound(String username,
+			UsernameNotFoundException notFound) {
+		_logger.debug("User '" + username + "' not found");
 
-        if (!cacheWasUsed) {
-            this.userCache.putUserInCache(user);
-        }
-
-        Object principalToReturn = user;
-
-        if (forcePrincipalAsString) {
-            principalToReturn = user.getUsername();
-        }
-
-        return createSuccessAuthentication(principalToReturn, authentication, user);
-    }
+		if (hideUserNotFoundExceptions) {
+		    throw new BadCredentialsException(messages.getMessage(
+		            "AbstractUserDetailsAuthenticationProvider.badCredentials", "Bad credentials"));
+		} else {
+		    throw notFound; //re-throw
+		}
+	}
 
     /**
      * Creates a successful {@link Authentication} object.<p>Protected so subclasses can override.</p>
